@@ -3,10 +3,48 @@
 package proxy
 
 import (
+	"context"
+	"errors"
+	"sync/atomic"
+
 	"github.com/luraproject/lura/v2/config"
 	"github.com/luraproject/lura/v2/logging"
 	"github.com/luraproject/lura/v2/sd"
 )
+
+// ErrServiceDraining is the error returned when the gateway is shutting down
+// and new backend requests are no longer accepted
+var ErrServiceDraining = errors.New("service is shutting down")
+
+var draining atomic.Bool
+
+// StartDraining marks the proxy layer as draining: new backend requests are
+// rejected with ErrServiceDraining while the in-flight ones are allowed to
+// complete
+func StartDraining() {
+	draining.Store(true)
+}
+
+// IsDraining reports whether the proxy layer is draining
+func IsDraining() bool {
+	return draining.Load()
+}
+
+// resetDraining clears the draining flag. It is intended for tests
+func resetDraining() {
+	draining.Store(false)
+}
+
+// NewDrainMiddleware rejects new requests once the proxy layer starts
+// draining. Requests already past this point are allowed to complete
+func NewDrainMiddleware(next Proxy) Proxy {
+	return func(ctx context.Context, request *Request) (*Response, error) {
+		if IsDraining() {
+			return nil, ErrServiceDraining
+		}
+		return next(ctx, request)
+	}
+}
 
 // Factory creates proxies based on the received endpoint configuration.
 //
@@ -68,6 +106,7 @@ func (pf defaultFactory) New(cfg *config.EndpointConfig) (p Proxy, err error) {
 		return
 	}
 
+	p = NewDrainMiddleware(p)
 	p = NewPluginMiddleware(pf.logger, cfg)(p)
 	p = NewStaticMiddleware(pf.logger, cfg)(p)
 	return

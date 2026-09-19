@@ -9,17 +9,20 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/luraproject/lura/v2/config"
 	"github.com/luraproject/lura/v2/core"
 	"github.com/luraproject/lura/v2/logging"
+	"github.com/luraproject/lura/v2/proxy"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -58,6 +61,128 @@ var (
 	ErrPublicKey = errors.New("public key not defined")
 	loggerPrefix = "[SERVICE: HTTP Server]"
 )
+
+const (
+	// DefaultHealthCheckPath is the default path for the liveness endpoint
+	DefaultHealthCheckPath = "/health"
+	// ReadyCheckPath is the path for the readiness endpoint. It reports
+	// whether the gateway is draining
+	ReadyCheckPath = "/ready"
+)
+
+// connectionTracker tracks the in-flight requests being processed by the
+// server so the graceful shutdown can wait for them to complete before
+// forcefully closing the remaining connections
+type connectionTracker struct {
+	mu       sync.Mutex
+	active   int64
+	draining atomic.Bool
+	done     chan struct{}
+	closed   bool
+}
+
+func newConnectionTracker() *connectionTracker {
+	return &connectionTracker{done: make(chan struct{})}
+}
+
+// begin registers a new in-flight request. It returns false if the server
+// is draining and no new requests should be accepted
+func (t *connectionTracker) begin() bool {
+	if t.draining.Load() {
+		return false
+	}
+	t.mu.Lock()
+	t.active++
+	t.mu.Unlock()
+	return true
+}
+
+// end unregisters an in-flight request. When the server is draining and the
+// last in-flight request finishes, the done channel is closed
+func (t *connectionTracker) end() {
+	t.mu.Lock()
+	t.active--
+	if t.draining.Load() && t.active == 0 && !t.closed {
+		t.closed = true
+		close(t.done)
+	}
+	t.mu.Unlock()
+}
+
+// startDraining flags the tracker as draining so no new requests are
+// accepted. If there are no in-flight requests, the done channel is closed
+func (t *connectionTracker) startDraining() {
+	t.draining.Store(true)
+	t.mu.Lock()
+	if t.active == 0 && !t.closed {
+		t.closed = true
+		close(t.done)
+	}
+	t.mu.Unlock()
+}
+
+// activeRequests returns the number of in-flight requests
+func (t *connectionTracker) activeRequests() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.active
+}
+
+// isDraining reports whether the tracker is draining
+func (t *connectionTracker) isDraining() bool {
+	return t.draining.Load()
+}
+
+// handler wraps the received handler so every request is tracked. Requests
+// received while draining are rejected with a 503 status code
+func (t *connectionTracker) handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if !t.begin() {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusServiceUnavailable)
+			rw.Write([]byte(`{"error":"service is shutting down"}`)) // skipcq: GO-S0907
+			return
+		}
+		defer t.end()
+		next.ServeHTTP(rw, req)
+	})
+}
+
+// healthHandler exposes the liveness and readiness endpoints and delegates
+// any other request to the received handler
+func healthHandler(healthPath string, tracker *connectionTracker, next http.Handler) http.Handler {
+	if healthPath == "" {
+		healthPath = DefaultHealthCheckPath
+	}
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case healthPath:
+			writeHealthResponse(rw, http.StatusOK, map[string]interface{}{
+				"status": "ok",
+			})
+		case ReadyCheckPath:
+			draining := tracker.isDraining()
+			status := http.StatusOK
+			state := "ready"
+			if draining {
+				status = http.StatusServiceUnavailable
+				state = "draining"
+			}
+			writeHealthResponse(rw, status, map[string]interface{}{
+				"status":   state,
+				"draining": draining,
+			})
+		default:
+			next.ServeHTTP(rw, req)
+		}
+	})
+}
+
+func writeHealthResponse(rw http.ResponseWriter, status int, body map[string]interface{}) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(body) // skipcq: GO-S0907
+}
 
 // InitHTTPDefaultTransport ensures the default HTTP transport is configured just once per execution
 func InitHTTPDefaultTransport(cfg config.ServiceConfig) {
@@ -109,7 +234,8 @@ func RunServer(ctx context.Context, cfg config.ServiceConfig, handler http.Handl
 func RunServerWithLoggerFactory(l logging.Logger) func(context.Context, config.ServiceConfig, http.Handler) error {
 	return func(ctx context.Context, cfg config.ServiceConfig, handler http.Handler) error {
 		done := make(chan error)
-		s := NewServerWithLogger(cfg, handler, l)
+		tracker := newConnectionTracker()
+		s := NewServerWithLogger(cfg, healthHandler(cfg.HealthCheckPath, tracker, tracker.handler(handler)), l)
 
 		if s.TLSConfig == nil {
 			go func() {
@@ -150,14 +276,52 @@ func RunServerWithLoggerFactory(l logging.Logger) func(context.Context, config.S
 		case err := <-done:
 			return err
 		case <-ctx.Done():
-			if cfg.MaxShutdownDuration <= 0 {
-				return s.Shutdown(context.Background())
-			}
-			withTimeout, cancel := context.WithTimeout(context.Background(), cfg.MaxShutdownDuration)
-			defer cancel()
-			return s.Shutdown(withTimeout)
+			return gracefulShutdown(s, tracker, cfg, l)
 		}
 	}
+}
+
+// gracefulShutdown stops accepting new connections, waits for all the
+// in-flight requests to complete within the configured timeout and, once
+// the timeout expires, forcefully closes the remaining connections
+func gracefulShutdown(s *http.Server, tracker *connectionTracker, cfg config.ServiceConfig, l logging.Logger) error {
+	if l == nil {
+		l = logging.NoOp
+	}
+	// flag the proxy layer and the connection tracker as draining so no new
+	// requests are accepted while the in-flight ones complete
+	proxy.StartDraining()
+	tracker.startDraining()
+	l.Info(fmt.Sprintf("%s Draining %d in-flight request(s)", loggerPrefix, tracker.activeRequests()))
+
+	timeout := cfg.GracefulShutdownTimeout
+	if timeout <= 0 {
+		timeout = cfg.MaxShutdownDuration
+	}
+
+	shutdownCtx := context.Background()
+	cancel := func() {}
+	if timeout > 0 {
+		shutdownCtx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
+	defer cancel()
+
+	// stop accepting new connections and wait for the in-flight requests
+	shutdownErr := s.Shutdown(shutdownCtx)
+
+	// wait for all the tracked in-flight requests to complete within the
+	// configured timeout. On timeout, forcefully close the remaining
+	// connections
+	select {
+	case <-tracker.done:
+		l.Info(loggerPrefix + " All in-flight requests completed")
+	case <-shutdownCtx.Done():
+		l.Warning(fmt.Sprintf("%s Graceful shutdown timeout (%s) exceeded, closing connections", loggerPrefix, timeout))
+		if err := s.Close(); err != nil && shutdownErr == nil {
+			shutdownErr = err
+		}
+	}
+	return shutdownErr
 }
 
 // NewServer returns a http.Server ready to serve the injected handler
