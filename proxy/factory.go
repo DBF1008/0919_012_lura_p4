@@ -70,6 +70,9 @@ func (pf defaultFactory) New(cfg *config.EndpointConfig) (p Proxy, err error) {
 
 	p = NewPluginMiddleware(pf.logger, cfg)(p)
 	p = NewStaticMiddleware(pf.logger, cfg)(p)
+	// the drain middleware is the outermost layer so new requests are rejected
+	// as soon as the gateway starts draining, while in-flight ones complete
+	p = NewDrainMiddleware(p)
 	return
 }
 

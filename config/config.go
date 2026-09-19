@@ -193,6 +193,18 @@ type ServiceConfig struct {
 	// of the service. If 0, it will wait indefinitely until all the requests are served
 	// or the process is killed.
 	MaxShutdownDuration time.Duration `mapstructure:"max_shutdown_wait_time"`
+
+	// GracefulShutdownTimeout is the maximum duration to wait for the in-flight
+	// requests to complete during the graceful shutdown, once the server has
+	// stopped accepting new connections. When the timeout is exceeded, the
+	// remaining connections are forcefully closed. If 0, MaxShutdownDuration
+	// is used instead.
+	GracefulShutdownTimeout time.Duration `mapstructure:"graceful_shutdown_timeout"`
+
+	// HealthCheckPath is the path where the liveness health check endpoint is
+	// exposed. If empty, it defaults to /health. The readiness endpoint, which
+	// also reports whether the gateway is draining, is exposed at /ready.
+	HealthCheckPath string `mapstructure:"health_check_path"`
 }
 
 // AsyncAgent defines the configuration of a single subscriber/consumer to be initialized

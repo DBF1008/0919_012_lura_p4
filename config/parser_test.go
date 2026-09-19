@@ -5,7 +5,47 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
+
+func TestNewParser_gracefulShutdownAndHealthCheck(t *testing.T) {
+	configPath := "/tmp/graceful_shutdown.json"
+	configContent := []byte(`{
+    "version": 3,
+    "name": "graceful gateway",
+    "port": 8080,
+    "timeout": "3s",
+    "graceful_shutdown_timeout": "10s",
+    "health_check_path": "/status/health",
+    "endpoints": [
+        {
+            "endpoint": "/foo",
+            "method": "GET",
+            "backend": [
+                {
+                    "host": ["http://127.0.0.1:8080"],
+                    "url_pattern": "/"
+                }
+            ]
+        }
+    ]
+}`)
+	if err := os.WriteFile(configPath, configContent, 0644); err != nil {
+		t.FailNow()
+	}
+	defer os.Remove(configPath)
+
+	serviceConfig, err := NewParser().Parse(configPath)
+	if err != nil {
+		t.Fatal("Unexpected error. Got", err.Error())
+	}
+	if serviceConfig.GracefulShutdownTimeout != 10*time.Second {
+		t.Errorf("unexpected graceful_shutdown_timeout value. have %v, want 10s", serviceConfig.GracefulShutdownTimeout)
+	}
+	if serviceConfig.HealthCheckPath != "/status/health" {
+		t.Errorf("unexpected health_check_path value. have %q, want /status/health", serviceConfig.HealthCheckPath)
+	}
+}
 
 func TestNewParser_ok(t *testing.T) {
 	configPath := "/tmp/ok.json"

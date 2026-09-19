@@ -167,6 +167,8 @@ type parseableServiceConfig struct {
 	UseH2C                bool                       `json:"use_h2c,omitempty"`
 	DNSCacheTTL           string                     `json:"dns_cache_ttl"`
 	MaxShutdownDuration   string                     `json:"max_shutdown_wait_time"`
+	GracefulShutdownTimeout string                   `json:"graceful_shutdown_timeout"`
+	HealthCheckPath       string                     `json:"health_check_path"`
 }
 
 func (p *parseableServiceConfig) normalize() ServiceConfig {
@@ -201,6 +203,8 @@ func (p *parseableServiceConfig) normalize() ServiceConfig {
 		UseH2C:                p.UseH2C,
 		DNSCacheTTL:           parseDuration(p.DNSCacheTTL),
 		MaxShutdownDuration:   parseDuration(p.MaxShutdownDuration),
+		GracefulShutdownTimeout: parseDuration(p.GracefulShutdownTimeout),
+		HealthCheckPath:       p.HealthCheckPath,
 	}
 	if p.TLS != nil {
 		cfg.TLS = &TLS{

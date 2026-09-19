@@ -15,11 +15,13 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/luraproject/lura/v2/config"
 	"github.com/luraproject/lura/v2/core"
 	"github.com/luraproject/lura/v2/logging"
+	"github.com/luraproject/lura/v2/proxy"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -58,6 +60,118 @@ var (
 	ErrPublicKey = errors.New("public key not defined")
 	loggerPrefix = "[SERVICE: HTTP Server]"
 )
+
+const (
+	// DefaultHealthCheckPath is the path where the liveness endpoint is
+	// exposed when the configuration does not define one
+	DefaultHealthCheckPath = "/health"
+	// ReadinessCheckPath is the path where the readiness endpoint is exposed.
+	// It reports whether the gateway is draining
+	ReadinessCheckPath = "/ready"
+)
+
+// connTracker tracks the in-flight requests being served and whether the
+// server is draining, so the graceful shutdown can wait for the active
+// requests to complete and the readiness endpoint can report the drain state.
+type connTracker struct {
+	active   sync.WaitGroup
+	draining atomic.Bool
+}
+
+// isDraining reports whether the server is draining (shutting down)
+func (t *connTracker) isDraining() bool {
+	return t.draining.Load()
+}
+
+// startDraining flags the server as draining, so new requests are rejected
+func (t *connTracker) startDraining() {
+	t.draining.Store(true)
+}
+
+// activeRequests returns the number of in-flight requests being served
+func (t *connTracker) activeRequests() chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		t.active.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// track wraps a handler so every served request is accounted for until it
+// completes. Requests arriving while draining are rejected with a 503 error.
+func (t *connTracker) track(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if t.isDraining() {
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
+		t.active.Add(1)
+		defer t.active.Done()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// healthCheckHandler serves the liveness (health check) and readiness
+// endpoints, delegating any other request to the wrapped handler. The
+// readiness endpoint reports whether the gateway is draining.
+func healthCheckHandler(healthCheckPath string, t *connTracker, next http.Handler) http.Handler {
+	if healthCheckPath == "" {
+		healthCheckPath = DefaultHealthCheckPath
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case healthCheckPath:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case ReadinessCheckPath:
+			w.Header().Set("Content-Type", "application/json")
+			if t.isDraining() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprint(w, `{"status":"draining","draining":true}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"status":"ready","draining":false}`)
+		default:
+			next.ServeHTTP(w, r)
+		}
+	})
+}
+
+// gracefulShutdown drains the server: it flags the gateway as draining so new
+// requests are rejected, stops accepting new connections and waits for all the
+// in-flight requests to complete within the configured timeout. If the timeout
+// is exceeded, the remaining connections are forcefully closed.
+func gracefulShutdown(cfg config.ServiceConfig, s *http.Server, t *connTracker) error {
+	t.startDraining()
+	proxy.StartDraining()
+
+	timeout := cfg.GracefulShutdownTimeout
+	if timeout <= 0 {
+		timeout = cfg.MaxShutdownDuration
+	}
+
+	ctx := context.Background()
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+
+	// Shutdown stops accepting new connections and blocks until all the
+	// in-flight requests complete or the context deadline is exceeded.
+	err := s.Shutdown(ctx)
+	if err != nil {
+		// the drain timeout was exceeded: force-close the remaining connections
+		_ = s.Close()
+		return err
+	}
+	// ensure all the tracked in-flight requests have completed
+	<-t.activeRequests()
+	return nil
+}
 
 // InitHTTPDefaultTransport ensures the default HTTP transport is configured just once per execution
 func InitHTTPDefaultTransport(cfg config.ServiceConfig) {
@@ -108,56 +222,71 @@ func RunServer(ctx context.Context, cfg config.ServiceConfig, handler http.Handl
 
 func RunServerWithLoggerFactory(l logging.Logger) func(context.Context, config.ServiceConfig, http.Handler) error {
 	return func(ctx context.Context, cfg config.ServiceConfig, handler http.Handler) error {
-		done := make(chan error)
-		s := NewServerWithLogger(cfg, handler, l)
+		return runServer(ctx, cfg, handler, l, nil)
+	}
+}
 
-		if s.TLSConfig == nil {
-			go func() {
-				done <- s.ListenAndServe()
-			}()
-		} else {
-			if cfg.TLS.PublicKey != "" || cfg.TLS.PrivateKey != "" {
-				cfg.TLS.Keys = append(cfg.TLS.Keys, config.TLSKeyPair{
-					PublicKey:  cfg.TLS.PublicKey,
-					PrivateKey: cfg.TLS.PrivateKey,
-				})
-			}
-			if len(cfg.TLS.Keys) == 0 {
-				return ErrPublicKey
-			}
-			for _, k := range cfg.TLS.Keys {
-				if k.PublicKey == "" {
-					return ErrPublicKey
-				}
-				if k.PrivateKey == "" {
-					return ErrPrivateKey
-				}
-				cert, err := tls.LoadX509KeyPair(k.PublicKey, k.PrivateKey)
-				if err != nil {
-					return err
-				}
-				s.TLSConfig.Certificates = append(s.TLSConfig.Certificates, cert)
-			}
+// runServer runs the given server handler until the context is cancelled or
+// the server stops, shutting it down gracefully. If serve is nil, the serve
+// function is built from the configuration (with or without TLS).
+func runServer(ctx context.Context, cfg config.ServiceConfig, handler http.Handler, l logging.Logger, serve func(*http.Server) error) error {
+	done := make(chan error)
+	tracker := &connTracker{}
+	handler = healthCheckHandler(cfg.HealthCheckPath, tracker, tracker.track(handler))
+	s := NewServerWithLogger(cfg, handler, l)
 
-			go func() {
-				// since we already use the list of certificates in the config
-				// we do not need to specify the files for public and private key here
-				done <- s.ListenAndServeTLS("", "")
-			}()
-		}
-
-		select {
-		case err := <-done:
+	if serve == nil {
+		var err error
+		serve, err = serveFunc(s, cfg)
+		if err != nil {
 			return err
-		case <-ctx.Done():
-			if cfg.MaxShutdownDuration <= 0 {
-				return s.Shutdown(context.Background())
-			}
-			withTimeout, cancel := context.WithTimeout(context.Background(), cfg.MaxShutdownDuration)
-			defer cancel()
-			return s.Shutdown(withTimeout)
 		}
 	}
+
+	go func() {
+		done <- serve(s)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return gracefulShutdown(cfg, s, tracker)
+	}
+}
+
+// serveFunc returns the function that runs the server, loading the TLS
+// certificates into the server TLS configuration if required.
+func serveFunc(s *http.Server, cfg config.ServiceConfig) (func(*http.Server) error, error) {
+	if s.TLSConfig == nil {
+		return (*http.Server).ListenAndServe, nil
+	}
+	if cfg.TLS.PublicKey != "" || cfg.TLS.PrivateKey != "" {
+		cfg.TLS.Keys = append(cfg.TLS.Keys, config.TLSKeyPair{
+			PublicKey:  cfg.TLS.PublicKey,
+			PrivateKey: cfg.TLS.PrivateKey,
+		})
+	}
+	if len(cfg.TLS.Keys) == 0 {
+		return nil, ErrPublicKey
+	}
+	for _, k := range cfg.TLS.Keys {
+		if k.PublicKey == "" {
+			return nil, ErrPublicKey
+		}
+		if k.PrivateKey == "" {
+			return nil, ErrPrivateKey
+		}
+		cert, err := tls.LoadX509KeyPair(k.PublicKey, k.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+		s.TLSConfig.Certificates = append(s.TLSConfig.Certificates, cert)
+	}
+
+	// since we already use the list of certificates in the config
+	// we do not need to specify the files for public and private key here
+	return func(s *http.Server) error { return s.ListenAndServeTLS("", "") }, nil
 }
 
 // NewServer returns a http.Server ready to serve the injected handler
